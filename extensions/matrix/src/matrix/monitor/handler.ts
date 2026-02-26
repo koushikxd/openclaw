@@ -498,13 +498,15 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
         storePath,
         sessionKey: route.sessionKey,
       });
-      const body = core.channel.reply.formatAgentEnvelope({
+      const body = core.channel.reply.formatInboundEnvelope({
         channel: "Matrix",
         from: envelopeFrom,
         timestamp: eventTs ?? undefined,
         previousTimestamp,
         envelope: envelopeOptions,
         body: textWithId,
+        chatType: threadRootId ? "thread" : isDirectMessage ? "direct" : "channel",
+        sender: { name: senderName, username: senderId.split(":")[0]?.replace(/^@/, "") },
       });
 
       const groupSystemPrompt = roomConfig?.systemPrompt?.trim() || undefined;
