@@ -9,9 +9,72 @@ import { ensureAuthStoreFile, resolveAuthStorePath, resolveLegacyAuthStorePath }
 import type { AuthProfileCredential, AuthProfileStore, ProfileUsageStats } from "./types.js";
 
 type LegacyAuthStore = Record<string, AuthProfileCredential>;
+type LoadAuthProfileStoreOptions = {
+  allowKeychainPrompt?: boolean;
+  readOnly?: boolean;
+};
 
 function isAuthStoreReadOnly(): boolean {
   return process.env.OPENCLAW_AUTH_STORE_READONLY === "1";
+}
+
+const runtimeAuthStoreSnapshots = new Map<string, AuthProfileStore>();
+
+function resolveRuntimeStoreKey(agentDir?: string): string {
+  return resolveAuthStorePath(agentDir);
+}
+
+function cloneAuthProfileStore(store: AuthProfileStore): AuthProfileStore {
+  return structuredClone(store);
+}
+
+function resolveRuntimeAuthProfileStore(agentDir?: string): AuthProfileStore | null {
+  if (runtimeAuthStoreSnapshots.size === 0) {
+    return null;
+  }
+
+  const mainKey = resolveRuntimeStoreKey(undefined);
+  const requestedKey = resolveRuntimeStoreKey(agentDir);
+  const mainStore = runtimeAuthStoreSnapshots.get(mainKey);
+  const requestedStore = runtimeAuthStoreSnapshots.get(requestedKey);
+
+  if (!agentDir || requestedKey === mainKey) {
+    if (!mainStore) {
+      return null;
+    }
+    return cloneAuthProfileStore(mainStore);
+  }
+
+  if (mainStore && requestedStore) {
+    return mergeAuthProfileStores(
+      cloneAuthProfileStore(mainStore),
+      cloneAuthProfileStore(requestedStore),
+    );
+  }
+  if (requestedStore) {
+    return cloneAuthProfileStore(requestedStore);
+  }
+  if (mainStore) {
+    return cloneAuthProfileStore(mainStore);
+  }
+
+  return null;
+}
+
+export function replaceRuntimeAuthProfileStoreSnapshots(
+  entries: Array<{ agentDir?: string; store: AuthProfileStore }>,
+): void {
+  runtimeAuthStoreSnapshots.clear();
+  for (const entry of entries) {
+    runtimeAuthStoreSnapshots.set(
+      resolveRuntimeStoreKey(entry.agentDir),
+      cloneAuthProfileStore(entry.store),
+    );
+  }
+}
+
+export function clearRuntimeAuthProfileStoreSnapshots(): void {
+  runtimeAuthStoreSnapshots.clear();
 }
 
 function _syncAuthProfileStore(target: AuthProfileStore, source: AuthProfileStore): void {
@@ -57,13 +120,26 @@ function coerceLegacyStore(raw: unknown): LegacyAuthStore | null {
       continue;
     }
     const typed = value as Partial<AuthProfileCredential>;
-    if (typed.type !== "api_key" && typed.type !== "oauth" && typed.type !== "token") {
+    const mode = (typed as { mode?: unknown }).mode;
+    const credentialType =
+      typed.type ?? (mode === "api_key" || mode === "oauth" || mode === "token" ? mode : undefined);
+    if (credentialType !== "api_key" && credentialType !== "oauth" && credentialType !== "token") {
       continue;
     }
-    entries[key] = {
-      ...typed,
+    const legacyApiKey = (typed as { apiKey?: unknown }).apiKey;
+    const raw_entry: Record<string, unknown> = {
+      ...(typed as Record<string, unknown>),
+      type: credentialType,
       provider: String(typed.provider ?? key),
-    } as AuthProfileCredential;
+    };
+    if (
+      credentialType === "api_key" &&
+      typeof raw_entry.key !== "string" &&
+      typeof legacyApiKey === "string"
+    ) {
+      raw_entry.key = legacyApiKey;
+    }
+    entries[key] = raw_entry as AuthProfileCredential;
   }
   return Object.keys(entries).length > 0 ? entries : null;
 }
@@ -272,27 +348,25 @@ export function loadAuthProfileStore(): AuthProfileStore {
 
 function loadAuthProfileStoreForAgent(
   agentDir?: string,
-  _options?: { allowKeychainPrompt?: boolean },
+  options?: LoadAuthProfileStoreOptions,
 ): AuthProfileStore {
+  const readOnly = options?.readOnly === true;
   const authPath = resolveAuthStorePath(agentDir);
   const raw = loadJsonFile(authPath);
   const asStore = coerceAuthStore(raw);
   if (asStore) {
-    // Sync from external CLI tools on every load
     const synced = syncExternalCliCredentials(asStore);
-    if (synced && !isAuthStoreReadOnly()) {
+    if (synced && !readOnly && !isAuthStoreReadOnly()) {
       saveJsonFile(authPath, asStore);
     }
     return asStore;
   }
 
-  // Fallback: inherit auth-profiles from main agent if subagent has none
-  if (agentDir) {
-    const mainAuthPath = resolveAuthStorePath(); // without agentDir = main
+  if (agentDir && !readOnly) {
+    const mainAuthPath = resolveAuthStorePath();
     const mainRaw = loadJsonFile(mainAuthPath);
     const mainStore = coerceAuthStore(mainRaw);
     if (mainStore && Object.keys(mainStore.profiles).length > 0) {
-      // Clone main store to subagent directory for auth inheritance
       saveJsonFile(authPath, mainStore);
       log.info("inherited auth-profiles from main agent", { agentDir });
       return mainStore;
@@ -311,14 +385,12 @@ function loadAuthProfileStoreForAgent(
 
   const mergedOAuth = mergeOAuthFileIntoStore(store);
   const syncedCli = syncExternalCliCredentials(store);
-  const shouldWrite = legacy !== null || mergedOAuth || syncedCli;
+  const shouldWrite =
+    !readOnly && !isAuthStoreReadOnly() && (legacy !== null || mergedOAuth || syncedCli);
   if (shouldWrite) {
     saveJsonFile(authPath, store);
   }
 
-  // PR #368: legacy auth.json could get re-migrated from other agent dirs,
-  // overwriting fresh OAuth creds with stale tokens (fixes #363). Delete only
-  // after we've successfully written auth-profiles.json.
   if (shouldWrite && legacy !== null) {
     const legacyPath = resolveLegacyAuthStorePath(agentDir);
     try {
@@ -336,9 +408,9 @@ function loadAuthProfileStoreForAgent(
   return store;
 }
 
-export function ensureAuthProfileStore(
+export function loadAuthProfileStoreForRuntime(
   agentDir?: string,
-  options?: { allowKeychainPrompt?: boolean },
+  options?: LoadAuthProfileStoreOptions,
 ): AuthProfileStore {
   const store = loadAuthProfileStoreForAgent(agentDir, options);
   const authPath = resolveAuthStorePath(agentDir);
@@ -348,9 +420,31 @@ export function ensureAuthProfileStore(
   }
 
   const mainStore = loadAuthProfileStoreForAgent(undefined, options);
-  const merged = mergeAuthProfileStores(mainStore, store);
+  return mergeAuthProfileStores(mainStore, store);
+}
 
-  return merged;
+export function loadAuthProfileStoreForSecretsRuntime(agentDir?: string): AuthProfileStore {
+  return loadAuthProfileStoreForRuntime(agentDir, { readOnly: true, allowKeychainPrompt: false });
+}
+
+export function ensureAuthProfileStore(
+  agentDir?: string,
+  options?: { allowKeychainPrompt?: boolean },
+): AuthProfileStore {
+  const runtimeStore = resolveRuntimeAuthProfileStore(agentDir);
+  if (runtimeStore) {
+    return runtimeStore;
+  }
+
+  const store = loadAuthProfileStoreForAgent(agentDir, options);
+  const authPath = resolveAuthStorePath(agentDir);
+  const mainAuthPath = resolveAuthStorePath();
+  if (!agentDir || authPath === mainAuthPath) {
+    return store;
+  }
+
+  const mainStore = loadAuthProfileStoreForAgent(undefined, options);
+  return mergeAuthProfileStores(mainStore, store);
 }
 
 export function saveAuthProfileStore(store: AuthProfileStore, agentDir?: string): void {
